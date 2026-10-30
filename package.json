@@ -1,0 +1,27 @@
+{
+  "name": "nan-usage-source",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "author": "adrialcaide",
+  "type": "module",
+  "files": [
+    "paseo-plugin.json",
+    "OVERVIEW.md",
+    "index.server.ts",
+    "server/",
+    "shared/",
+    "icon.svg"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.13.2",
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "zod": "^4.4.3"
+  }
+}
