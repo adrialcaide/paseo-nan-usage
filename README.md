@@ -1,11 +1,12 @@
 # nan usage · Paseo plugin
 
 A [Paseo](https://github.com/getpaseo/paseo) usage-source plugin that adds a **nan**
-([nan.builders](https://nan.builders)) card to the Usage modal: monthly quota rings,
-month-to-date counters, lifetime tokens and a per-model breakdown — on desktop, web,
-iOS and Android, on every client connected to the daemon where the plugin is installed.
+([nan.builders](https://nan.builders)) card to the Usage modal: the credit pool left in your
+billing period, counters and per-model credits for that same window, lifetime tokens and the
+image request budget — on desktop, web, iOS and Android, on every client connected to the
+daemon where the plugin is installed.
 
-![The nan card in Paseo's Usage modal: live quota rings, month-to-date balances and a per-model breakdown](./docs/usage-card.png)
+![The nan card in Paseo's Usage modal: the credits ring, billing-period balances and a per-model breakdown](./docs/usage-card.png)
 
 *Real account data; your numbers will differ.*
 
@@ -19,23 +20,38 @@ You need all of these before installing:
   (one global switch; every installed plugin runs unsandboxed as your user, so install
   what you trust)
 - A **nan inference API key** (`sk-…`) from [cloud.nan.builders](https://cloud.nan.builders/)
-  → Settings → API Keys. Only paid inference plans (`nan_member` or GLM premium) can
-  create keys, and platform tokens (`nan_pat_`) cannot read usage
+  → Settings → API Keys. Keys need credits: the `nan_member` plan (7,000 credits per billing
+  period) or Premium (20,000) include them, and the Community plan or no membership can create
+  one once a credit pack is bought. Platform tokens (`nan_pat_`) cannot read usage
 - Your nan login discoverable by the plugin — in practice, either you use OpenCode with
   nan (nothing to do, we read that store) or you set `NAN_API_KEY` /
   `~/.nan/credentials.json` once; see [Where the key is read from](#where-the-key-is-read-from)
 
 ## What the card shows
 
-- **Quota rings** — percent used this month per capped model. Rings come from nan's
-  live quota data when available (including each model's own reset instant), and fall
-  back to the [published catalog quotas](https://nan.builders/docs/models) otherwise:
-  deepseek-v4-flash 3B · mimo-v2.6-flash 1B · qwen3.8-flash 500M · glm5.3-flash 2B
-  tokens/month, plus the shared image pool (flux-2-klein + qwen-image-2.1, 100 req/month).
-  Models without monthly quota (the cluster models qwen3.6 and gemma4, and glm5.3's
-  billing-period allowance) intentionally show counters, never an invented percentage.
-- **Balances** — tokens and API requests so far this month (UTC), plus lifetime tokens.
-- **Details** — the effective window and per-model usage, e.g. `1.74M tok · 8.2k req`.
+- **Credits ring** — nan bills every credit-priced model against one pool per billing period
+  (7,000 credits on Inference, 20,000 on Premium), so the card has a single allowance ring:
+  percent of that pool used, resetting on your own billing date (Stripe), which is almost
+  never the 1st. A frozen subscription reads danger even at a low percentage. Accounts the
+  API does not bill in credits show counters only, never an invented percentage.
+- **Image budget ring** — the one counter still metered on the calendar month and outside
+  credits: the shared 100 requests/month pool (flux-2-klein + qwen-image-2.1).
+- **Rolling window** — glm5.3's 400M tokens per rolling 4 hours, a speed limit separate from
+  credits, taken from nan's live quota data when it reports one.
+- **Balances** — credits used and left in the period, credit packs with their expiry, then
+  tokens and API requests over the same billing window, plus lifetime tokens.
+- **Details** — the billing period, the in/out split, cached input, and a per-model breakdown
+  with what each model billed, e.g. `52.2 cr · 487.9M tok · 4.6k req`, credit-hungry first.
+  Models the catalog bills with no counter (gemma4, qwen3.6, qwen3-embedding, rerank, kokoro,
+  whisper) show `∞ unmetered` instead of a blank, since for them zero credits is the design, not
+  a rounding artefact. A credit-priced model whose spend rounds below 0.1 shows no figure.
+
+Per-model token allowances are gone for credit-billed plans: every chat model now spends the
+shared pool at its own price per token, so the plugin shows per-model *credits* instead of
+per-model rings. It keeps reading the per-model caps from nan's quota service for the accounts
+that still have them — the Gentle plan carries no credits and meters a monthly quota per model
+(`402 monthly_cap_reached`) — and decides which one applies from whether the API returned a
+credits block at all.
 
 Reports are cached by the daemon for five minutes.
 
@@ -81,14 +97,14 @@ All requests go to two fixed HTTPS origins with `Authorization: Bearer <key>`:
 
 | Endpoint | Purpose | Notes |
 | --- | --- | --- |
-| `GET https://api.nan.builders/v1/usage` | published usage API | one request per refresh, month-to-date |
-| `GET https://cloud-api.nan.builders/api/usage/quota` | live quota rings | per-model allowance and reset time; if it does not answer, the plugin falls back to the published catalog quotas and keeps working |
+| `GET https://api.nan.builders/v1/usage` | published usage API: counters, per-model breakdown and the credits block | one request month-to-date, plus one more over the billing period when the credits window started before this month, so the counters and the credit pool cover the same window |
+| `GET https://cloud-api.nan.builders/api/usage/quota` | glm5.3's rolling 4h window | undocumented dashboard service: if it does not answer, the card simply loses that one ring |
 
 - No telemetry, no third-party hosts, redirects are never followed.
 - Credential stores are opened read-only (SQLite connections as well); the plugin never
   writes to them and never refreshes tokens — `opencode`/your CLI owns rotation.
-- A custom `api_base` input (e.g. the Helmcode mirror) skips both the quota endpoint and
-  quota rings, rendering raw counters only.
+- A custom `api_base` (e.g. the Helmcode mirror) skips the quota endpoint and the catalog
+  rings: it renders only what that host reports about itself, credits included.
 
 ## Development
 

@@ -1,7 +1,7 @@
 {
   "id": "nan-usage-source",
   "name": "nan usage",
-  "description": "nan (nan.builders) token and request usage in the Paseo Usage modal.",
+  "description": "nan (nan.builders) credits, quotas and token usage in the Paseo Usage modal.",
   "media": [],
   "requirements": {
     "paseo": ">=0.11.0"

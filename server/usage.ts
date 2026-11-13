@@ -35,7 +35,26 @@ const ModelTotalsSchema = z.object({
   completion_tokens: ApiNumberSchema.optional(),
   total_tokens: ApiNumberSchema.optional(),
   api_requests: ApiNumberSchema.optional(),
+  cached_tokens: ApiNumberSchema.optional(),
+  credits: ApiNumberSchema.optional(),
 });
+
+/**
+ * Documented `UsageCredits`: the single pool every credit-billed model draws from, metered
+ * against the member's Stripe billing period (almost never the calendar month). `null` when
+ * the account is not billed in credits.
+ */
+const CreditsSchema = z.object({
+  period_start: z.string().optional(),
+  period_end: z.string().optional(),
+  allowance: ApiNumberSchema.optional(),
+  used: ApiNumberSchema.optional(),
+  remaining: ApiNumberSchema.optional(),
+  pack_credits: ApiNumberSchema.optional(),
+  pack_expires_at: z.string().nullable().optional(),
+  frozen: z.boolean().optional(),
+});
+export type UsageCredits = z.infer<typeof CreditsSchema>;
 
 const UsageResponseSchema = z.object({
   object: z.string().optional(),
@@ -47,6 +66,8 @@ const UsageResponseSchema = z.object({
       completion_tokens: ApiNumberSchema.optional(),
       total_tokens: ApiNumberSchema.optional(),
       api_requests: ApiNumberSchema.optional(),
+      cached_tokens: ApiNumberSchema.optional(),
+      credits: ApiNumberSchema.optional(),
       by_model: z.array(ModelTotalsSchema).default([]),
     })
     .default({ by_model: [] }),
@@ -59,6 +80,7 @@ const UsageResponseSchema = z.object({
       cached_at: z.string().optional(),
     })
     .optional(),
+  credits: CreditsSchema.nullable().optional(),
 });
 type UsageResponse = z.infer<typeof UsageResponseSchema>;
 
@@ -86,14 +108,15 @@ const QuotaResponseSchema = z.object({
 type QuotaResponse = z.infer<typeof QuotaResponseSchema>;
 
 /**
- * Documented per-member quotas, metered against the calendar month (per the 402 docs:
- * "the calendar month for the models counted per month"). nan's `/usage` endpoint does
- * not expose limits per account, so these come from the model catalog at
- * https://nan.builders/docs/models and are checked against the OpenAPI description.
+ * Documented per-member quotas that still live outside the credits pool. Since the 2026-11
+ * billing change the chat models have no allowance of their own: every one of them draws
+ * credits from the single pool in `UsageCredits`, so the only catalog ring left is the image
+ * budget, which the docs meter against the calendar month and explicitly keep separate from
+ * credits ("vuelve a cero con el mes natural y no toca tus créditos").
  *
- * Deliberately absent: glm5.3's 3,000M allowance resets on the member's billing period
- * (not derivable from calendar rows) and its 400M cap is per rolling 4h (finer than the
- * daily granularity of /usage rows). Showing either would misstate the quota.
+ * Also deliberately absent: glm5.3's 400M cap per rolling 4h. It is a speed limit, not a
+ * balance, and it is finer than the daily granularity of `/usage` rows, so it only ever
+ * renders from the live quota service below.
  */
 interface MonthlyQuota {
   /** Stable feature id, used to scope window ids per quota. */
@@ -106,14 +129,30 @@ interface MonthlyQuota {
 }
 
 const MONTHLY_QUOTAS: MonthlyQuota[] = [
-  { id: "deepseek-v4-flash", label: "deepseek-v4-flash", unit: "tokens", limit: 3e9, models: ["deepseek-v4-flash"] },
-  { id: "mimo-v2.6-flash", label: "mimo-v2.6-flash", unit: "tokens", limit: 1e9, models: ["mimo-v2.6-flash"] },
-  { id: "qwen3.8-flash", label: "qwen3.8-flash", unit: "tokens", limit: 5e8, models: ["qwen3.8-flash"] },
-  { id: "glm5.3-flash", label: "glm5.3-flash", unit: "tokens", limit: 2e9, models: ["glm5.3-flash"] },
   // flux-2-klein and qwen-image-2.1 share one 100-requests/month pool ("shared with
   // flux-2-klein" in the catalog). The pool counts requests, not images.
   { id: "image-pool", label: "Images", unit: "requests", limit: 100, models: ["flux-2-klein", "qwen-image-2.1"] },
 ];
+
+/** Plans that include credits every billing period, keyed by their documented allowance. */
+const PLAN_BY_ALLOWANCE: Record<number, string> = { 7000: "Inference", 20000: "Premium" };
+
+/**
+ * Catalog models billed with "no counter" at https://nan.builders/docs/choose-a-model: they draw
+ * no credits at all, so a `0` in their `credits` field is a feature, not a rounding artefact.
+ * The docs are explicit that this is not an infinite allowance either, only the rpm limits keep
+ * applying, hence the "unmetered" wording next to the mark.
+ *
+ * Image models are deliberately absent: they have their own request budget, rendered as a ring.
+ */
+const UNMETERED_MODELS = new Set([
+  "gemma4",
+  "qwen3.6",
+  "qwen3-embedding",
+  "rerank",
+  "kokoro",
+  "whisper",
+]);
 
 /** Env variable names that may hold an inference API key (`sk-...`). */
 const ENV_KEY_LOCATORS = ["NAN_API_KEY"];
@@ -472,6 +511,12 @@ function compactTokens(value: number | undefined): string {
   return formatTokens(value);
 }
 
+/** Credits come with one decimal: `82.8`, and whole numbers stay plain (`7,000`). */
+function formatCredits(value: number | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  return groupFormatter.format(Math.round(value * 10) / 10);
+}
+
 function pickMetric(row: ModelTotal, unit: MonthlyQuota["unit"]): number {
   const value = unit === "tokens" ? row.total_tokens : row.api_requests;
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -490,52 +535,124 @@ function isoOrNull(value: string | undefined): string | null {
 }
 
 /**
- * Rings from the live quota service. Periods use the endpoint's own vocabulary
- * (`periodEnd` per model; for glm5.3 that is the billing cycle, not a calendar month).
- * Rolling sub-windows come with a reported duration, so the SDK helper names them
- * ("4-hour"/"4h"). A model without an allowance or with cap 0 is unmetered: no ring.
- * Entries with zero usage show no ring either: the service lists the full model
- * catalog regardless of tier, so a 0% glm5.3 ring on a non-premium member would be
- * noise about a model the key cannot even call. Real usage implies reachability.
+ * Rolling sub-windows from the live quota service (glm5.3's 400M per rolling 4h) and, only for
+ * accounts that are not billed in credits, one ring per capped model.
+ *
+ * Which of the two applies depends on how the account pays. Credit-billed plans draw one shared
+ * pool, so the per-model `cap` the service still reports is legacy and rendering it would
+ * contradict the catalog (there is no allowance per model any more). Gentle is the exception the
+ * error table documents: it carries no credits and keeps a monthly quota per model
+ * (`402 monthly_cap_reached`), so for those accounts the caps are the real allowance and the
+ * `credits` block never arrives. `creditBilled` is what tells the two apart.
+ *
+ * Entries with zero usage show no ring either way: the service lists the full model catalog
+ * regardless of tier, so a 0% ring for a model the key cannot call is noise.
  */
-export function buildLiveWindows(quota: QuotaResponse): UsageWindow[] {
+export function buildLiveWindows(quota: QuotaResponse, creditBilled: boolean): UsageWindow[] {
   const windows: UsageWindow[] = [];
   for (const entry of quota.models) {
-    const slug = slugify(entry.model);
-    const allowance = positiveNumber(entry.fullCap) ?? positiveNumber(entry.cap);
-    const used = typeof entry.tokensUsed === "number" && Number.isFinite(entry.tokensUsed) ? entry.tokensUsed : null;
-    if (allowance !== undefined && used !== null && used > 0) {
-      const pct = usedPctOf(used, allowance);
+    const budget = positiveNumber(entry.fullWindowTokens) ?? positiveNumber(entry.windowTokens);
+    if (typeof entry.windowTokensUsed === "number" && entry.windowTokensUsed > 0 && budget !== undefined) {
+      const pct = (entry.windowTokensUsed / budget) * 100;
+      const hours = positiveNumber(entry.windowHours);
       windows.push(
-        windowFromUsedPct({
-          id: `${slug}:period`,
-          label: `${entry.model} · Current period`,
+        windowFromReportedDuration({
+          durationSeconds: hours !== undefined ? hours * 3600 : null,
+          scope: { id: slugify(entry.model), label: entry.model },
+          unknown: { id: "rolling", label: "Rolling", shortLabel: "roll" },
           utilizationPct: pct,
-          resetsAt: isoOrNull(entry.periodEnd ?? quota.periodEnd),
+          resetsAt: isoOrNull(entry.windowResetsAt),
           summary: true,
           tone: toneFromUsedPct(pct),
         }),
       );
     }
-    if (typeof entry.windowTokensUsed === "number" && entry.windowTokensUsed > 0) {
-      const budget = positiveNumber(entry.fullWindowTokens) ?? positiveNumber(entry.windowTokens);
-      if (budget !== undefined) {
-        const hours = positiveNumber(entry.windowHours);
-        windows.push(
-          windowFromReportedDuration({
-            durationSeconds: hours !== undefined ? hours * 3600 : null,
-            scope: { id: slug, label: entry.model },
-            unknown: { id: "rolling", label: "Rolling", shortLabel: "roll" },
-            utilizationPct: (entry.windowTokensUsed / budget) * 100,
-            resetsAt: isoOrNull(entry.windowResetsAt),
-            summary: true,
-            tone: toneFromUsedPct((entry.windowTokensUsed / budget) * 100),
-          }),
-        );
-      }
-    }
+    if (creditBilled) continue;
+    const allowance = positiveNumber(entry.fullCap) ?? positiveNumber(entry.cap);
+    const used = typeof entry.tokensUsed === "number" && Number.isFinite(entry.tokensUsed) ? entry.tokensUsed : null;
+    if (allowance === undefined || used === null || used <= 0) continue;
+    const pct = usedPctOf(used, allowance);
+    windows.push(
+      windowFromUsedPct({
+        id: `${slugify(entry.model)}:period`,
+        label: `${entry.model} · Current period`,
+        utilizationPct: pct,
+        resetsAt: isoOrNull(entry.periodEnd ?? quota.periodEnd),
+        summary: true,
+        tone: toneFromUsedPct(pct),
+      }),
+    );
   }
   return windows;
+}
+
+/** `2026-10-29T17:14:00Z` -> `2026-10-29`; undefined unless it parses as a date. */
+function dayFromIso(value: string | null | undefined): string | undefined {
+  if (!value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : undefined;
+}
+
+/**
+ * The single account-level ring: credits left in this billing period. `allowance` is the plan's
+ * pool (7,000 Inference · 20,000 Premium) and renews on the member's Stripe date, not on the
+ * 1st, which is why the reset shown is `period_end`. A frozen subscription is metered but
+ * unusable, so it reads danger even at a low percentage.
+ */
+export function buildCreditWindows(credits: UsageCredits | null | undefined): UsageWindow[] {
+  const allowance = positiveNumber(credits?.allowance);
+  if (allowance === undefined || typeof credits?.used !== "number") return [];
+  const pct = usedPctOf(credits.used, allowance);
+  return [
+    windowFromUsedPct({
+      id: "credits:period",
+      label: "Credits · Current period",
+      shortLabel: "mo",
+      utilizationPct: pct,
+      resetsAt: isoOrNull(credits.period_end),
+      summary: true,
+      tone: credits.frozen === true ? "danger" : toneFromUsedPct(pct),
+    }),
+  ];
+}
+
+/** Allowance and pack balances; packs are a remainder with no known total, so no percentage. */
+export function buildCreditBalances(credits: UsageCredits | null | undefined): UsageBalance[] {
+  if (!credits) return [];
+  const balances: UsageBalance[] = [];
+  const allowance = positiveNumber(credits.allowance);
+  if (allowance !== undefined && typeof credits.used === "number") {
+    const pct = usedPctOf(credits.used, allowance);
+    balances.push({
+      id: "credits_period",
+      label: "Credits · this period",
+      used: credits.used,
+      remaining: typeof credits.remaining === "number" ? credits.remaining : Math.max(0, allowance - credits.used),
+      limit: allowance,
+      unit: "credits",
+      resetsAt: isoOrNull(credits.period_end),
+      tone: credits.frozen === true ? "danger" : toneFromUsedPct(pct),
+    });
+  }
+  const packs = positiveNumber(credits.pack_credits);
+  if (packs !== undefined) {
+    balances.push({
+      id: "credits_packs",
+      label: "Credits · packs",
+      remaining: packs,
+      unit: "credits",
+      resetsAt: isoOrNull(credits.pack_expires_at ?? undefined),
+      // No tone: a pack has no known total, so there is no percentage to scale, and Paseo
+      // derives the tone from the remainder itself.
+    });
+  }
+  return balances;
+}
+
+/** Plan name from the documented credit allowance, when it matches a known tier. */
+export function planLabelFor(credits: UsageCredits | null | undefined): string | undefined {
+  const allowance = positiveNumber(credits?.allowance);
+  return allowance === undefined ? undefined : PLAN_BY_ALLOWANCE[allowance];
 }
 
 async function fetchQuota(apiKey: string, fetchApi: typeof fetch): Promise<QuotaResponse | null> {
@@ -554,9 +671,9 @@ async function fetchQuota(apiKey: string, fetchApi: typeof fetch): Promise<Quota
 }
 
 /**
- * Rings for the documented monthly quotas, built only for quotas the member touched
- * this month; a 0% ring for an unused model is noise. glm5.3 intentionally has no ring
- * (its period is the billing cycle, not the calendar month).
+ * Rings for the quotas still metered on the calendar month, built only for the ones the member
+ * touched this month; a 0% ring for an unused feature is noise. Chat models are not here: since
+ * the credits migration they share the single pool that `buildCreditWindows` renders.
  */
 export function buildMonthlyWindows(
   byModel: ModelTotal[],
@@ -589,38 +706,72 @@ export function buildMonthlyWindows(
   return windows;
 }
 
-export function toUsageReport(
-  resp: UsageResponse,
-  quota?: QuotaResponse | null,
-  catalogRings = true,
-): UsageReport {
+export interface ReportParts {
+  /**
+   * Counters to render: the billing period when the account is billed in credits (the pool and
+   * the token counters then cover the same window), otherwise the calendar month.
+   */
+  counters: UsageResponse;
+  /** Month-to-date report: the image budget is the one counter that still follows the calendar. */
+  month: UsageResponse;
+  /** Live quota service answer; only its rolling sub-windows are used any more. */
+  quota?: QuotaResponse | null;
+  /** False for mirror hosts, which meter their own catalogs. */
+  catalogRings?: boolean;
+}
+
+/** Credits of the report: the same object in either response, whichever answered first. */
+function creditsOf(parts: ReportParts): UsageCredits | null {
+  return parts.counters.credits ?? parts.month.credits ?? null;
+}
+
+export function toUsageReport(parts: ReportParts): UsageReport {
+  const { counters, month, quota } = parts;
+  const catalogRings = parts.catalogRings ?? true;
+  const credits = creditsOf(parts);
+  // The credit pool is metered on the billing period, so the counters shown beside it are
+  // labelled the same way; a month window keeps the old wording.
+  const periodWindow = counters !== month;
+  const windowName = periodWindow ? "this period" : "this month";
   const balances: UsageBalance[] = [];
   const details: UsageDetail[] = [];
 
-  const monthTotal = resp.totals.total_tokens;
-  if (typeof monthTotal === "number")
-    balances.push({ id: "month_tokens", label: "Tokens · this month", used: monthTotal, unit: "tokens" });
+  balances.push(...buildCreditBalances(credits));
 
-  const monthRequests = resp.totals.api_requests;
-  if (typeof monthRequests === "number")
-    balances.push({ id: "month_requests", label: "Requests · this month", used: monthRequests, unit: "requests" });
+  const total = counters.totals.total_tokens;
+  if (typeof total === "number")
+    balances.push({
+      id: "window_tokens",
+      label: `Tokens · ${windowName}`,
+      used: total,
+      unit: "tokens",
+    });
 
-  if (resp.all_time && typeof resp.all_time.total_tokens === "number")
+  const requests = counters.totals.api_requests;
+  if (typeof requests === "number")
+    balances.push({
+      id: "window_requests",
+      label: `Requests · ${windowName}`,
+      used: requests,
+      unit: "requests",
+    });
+
+  if (counters.all_time && typeof counters.all_time.total_tokens === "number")
     balances.push({
       id: "all_time_tokens",
       label: "Tokens · all time",
-      used: resp.all_time.total_tokens,
+      used: counters.all_time.total_tokens,
       unit: "tokens",
     });
 
   details.push({
     id: "window",
-    label: "Window (UTC)",
-    value: `${resp.start_date} → ${resp.end_date}`,
+    label: periodWindow ? "Billing period (UTC)" : "Window (UTC)",
+    value: `${counters.start_date} → ${counters.end_date}`,
   });
 
-  const prompt = resp.totals.prompt_tokens;
-  const completion = resp.totals.completion_tokens;
+  const prompt = counters.totals.prompt_tokens;
+  const completion = counters.totals.completion_tokens;
   if (typeof prompt === "number" && typeof completion === "number")
     details.push({
       id: "split",
@@ -628,31 +779,49 @@ export function toUsageReport(
       value: `${compactTokens(prompt)} / ${compactTokens(completion)}`,
     });
 
+  const cached = positiveNumber(counters.totals.cached_tokens);
+  if (cached !== undefined)
+    details.push({ id: "cached", label: "Cached input", value: compactTokens(cached) });
+
+  if (credits?.frozen === true)
+    details.push({
+      id: "frozen",
+      label: "Subscription",
+      value: "Frozen: credit-billed requests are refused until it is active",
+      tone: "danger",
+    });
+
   const seen = new Set<string>();
-  const models = [...resp.totals.by_model].sort(
-    (a, b) => (b.total_tokens ?? 0) - (a.total_tokens ?? 0) || a.model.localeCompare(b.model),
+  const models = [...counters.totals.by_model].sort(
+    (a, b) =>
+      (b.credits ?? 0) - (a.credits ?? 0) ||
+      (b.total_tokens ?? 0) - (a.total_tokens ?? 0) ||
+      a.model.localeCompare(b.model),
   );
   for (const model of models) {
     let id = `model_${slugify(model.model)}`;
     if (seen.has(id)) id = `${id}_${seen.size}`;
     seen.add(id);
-    details.push({
-      id,
-      label: model.model,
-      value: `${compactTokens(model.total_tokens)} tok · ${compactTokens(model.api_requests)} req`,
-    });
+    const billed = positiveNumber(model.credits);
+    const pieces = [
+      // Credit-billed models only show a figure once it reaches the API's one decimal; the
+      // no-counter ones show the mark instead, so a missing figure never reads as missing data.
+      billed !== undefined ? `${formatCredits(billed)} cr` : UNMETERED_MODELS.has(model.model) ? "∞ unmetered" : null,
+      `${compactTokens(model.total_tokens)} tok`,
+      `${compactTokens(model.api_requests)} req`,
+    ].filter((piece): piece is string => piece !== null);
+    details.push({ id, label: model.model, value: pieces.join(" · ") });
   }
+
+  const rolling = quota ? buildLiveWindows(quota, positiveNumber(credits?.allowance) !== undefined) : [];
+  const images = catalogRings ? buildMonthlyWindows(month.totals.by_model) : [];
 
   return {
     status: "available",
-    planLabel: undefined,
-    // Live quota rings when the dashboard service answered; documented catalog rings
-    // otherwise; none when the counters themselves came from a mirror host.
-    windows: quota
-      ? buildLiveWindows(quota)
-      : catalogRings
-        ? buildMonthlyWindows(resp.totals.by_model)
-        : [],
+    planLabel: planLabelFor(credits),
+    // The credit pool is the account's single allowance; the image budget is the one
+    // catalog counter left; rolling windows come from the live service when it answers.
+    windows: [...buildCreditWindows(credits), ...images, ...rolling],
     balances,
     details,
   };
@@ -666,24 +835,29 @@ function usesDefaultHost(base: string): boolean {
   }
 }
 
-export async function fetchUsage(
+/** A non-retryable answer that maps onto a Paseo unavailable report (rejected key, no identity). */
+class UsageUnavailableError extends Error {
+  readonly report: UsageReport;
+  constructor(report: UsageReport) {
+    super("nan usage unavailable");
+    this.report = report;
+  }
+}
+
+/**
+ * One page of `/usage` over `start_date` → today. `totals` and `totals.by_model` cover the whole
+ * requested window regardless of pagination, so `limit=1` keeps the page tiny, and `credits`
+ * always describes the billing period whatever the window.
+ */
+async function fetchUsageWindow(
+  base: string,
+  startDate: string,
+  apiKey: string,
   input: UsageInput,
-  fetchApi: typeof fetch = fetch,
-): Promise<UsageReport> {
-  const apiKey = await readApiKey(input);
-  if (!apiKey) throw new Error("nan credential store no longer exists");
-
-  const base = input.api_base ?? NAN_DEFAULT_API_BASE;
-  const isDefaultHost = usesDefaultHost(base);
-  // Kick the (undocumented) quota lookup off in parallel with the published endpoint;
-  // fetchQuota swallows every failure, so it can only enrich the report, never break it.
-  const quotaPromise = isDefaultHost ? fetchQuota(apiKey, fetchApi) : Promise.resolve(null);
-
+  fetchApi: typeof fetch,
+): Promise<UsageResponse> {
   const url = new URL("usage", base.endsWith("/") ? base : `${base}/`);
-  // Month-to-date in UTC: exactly the window the documented monthly quotas count,
-  // and `totals` / `totals.by_model` cover the full window regardless of pagination,
-  // so `limit=1` keeps the page tiny. `all_time` is always present in the response.
-  url.searchParams.set("start_date", monthStartUtc());
+  url.searchParams.set("start_date", startDate);
   url.searchParams.set("limit", "1");
 
   let res = await requestUsage(url.toString(), apiKey, fetchApi);
@@ -702,23 +876,65 @@ export async function fetchUsage(
 
   if (res.status === 401 || res.status === 403)
     // When the key lives in OpenCode's stores, say which CLI can refresh it.
-    return unavailable({
-      kind: "rejected",
-      status: res.status,
-      ...(input.store === "opencode" || input.store === "opencode_config" ? { refreshedBy: "opencode" } : {}),
-    });
+    throw new UsageUnavailableError(
+      unavailable({
+        kind: "rejected",
+        status: res.status,
+        ...(input.store === "opencode" || input.store === "opencode_config" ? { refreshedBy: "opencode" } : {}),
+      }),
+    );
   if (res.status === 404)
-    return unavailable({
-      kind: "no_quota",
-      detail:
-        "This nan account has no usage identity yet: it needs an API key, a linked Discord account, or a handle.",
-    });
+    throw new UsageUnavailableError(
+      unavailable({
+        kind: "no_quota",
+        detail:
+          "This nan account has no usage identity yet: it needs an API key, a linked Discord account, or a handle.",
+      }),
+    );
   if (!res.ok) throw new Error(`nan usage API returned ${res.status}`);
+  return UsageResponseSchema.parse(await res.json());
+}
+
+export async function fetchUsage(
+  input: UsageInput,
+  fetchApi: typeof fetch = fetch,
+): Promise<UsageReport> {
+  const apiKey = await readApiKey(input);
+  if (!apiKey) throw new Error("nan credential store no longer exists");
+
+  const base = input.api_base ?? NAN_DEFAULT_API_BASE;
+  const isDefaultHost = usesDefaultHost(base);
+  // Kick the (undocumented) quota lookup off in parallel with the published endpoint;
+  // fetchQuota swallows every failure, so it can only enrich the report, never break it.
+  const quotaPromise = isDefaultHost ? fetchQuota(apiKey, fetchApi) : Promise.resolve(null);
+
+  const monthStart = monthStartUtc();
+  let month: UsageResponse;
+  try {
+    month = await fetchUsageWindow(base, monthStart, apiKey, input, fetchApi);
+  } catch (error) {
+    if (error instanceof UsageUnavailableError) return error.report;
+    throw error;
+  }
+
+  // Credits renew on the member's Stripe date, almost never the 1st, so a month window would
+  // show counters wider than the pool the ring reports. Ask for the period itself when it
+  // started inside the month just fetched; any failure keeps the month counters, which are
+  // still truthful, just over a different window than the credit ring.
+  let counters = month;
+  const periodStart = dayFromIso(month.credits?.period_start);
+  if (periodStart && periodStart < monthStart) {
+    try {
+      counters = await fetchUsageWindow(base, periodStart, apiKey, input, fetchApi);
+    } catch {
+      counters = month;
+    }
+  }
 
   const quota = await quotaPromise;
   // Catalog quotas are published for api.nan.builders; a mirror host (e.g. Helmcode) may
-  // meter differently, so there neither live nor catalog rings are applied.
-  return toUsageReport(UsageResponseSchema.parse(await res.json()), quota, isDefaultHost);
+  // meter differently, so its rings are limited to what its own API reports.
+  return toUsageReport({ counters, month, quota, catalogRings: isDefaultHost });
 }
 
 export async function discover(): Promise<UsageAccount[]> {

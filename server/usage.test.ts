@@ -3,57 +3,96 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  buildCreditBalances,
+  buildCreditWindows,
   buildLiveWindows,
   buildMonthlyWindows,
   discover,
   fetchUsage,
   monthStartUtc,
   nextMonthResetIso,
+  planLabelFor,
   readApiKey,
   toUsageReport,
 } from "./usage.js";
 
-const SAMPLE_REPORT = {
-  object: "usage.report",
-  start_date: "2026-10-01",
-  end_date: "2026-10-29",
-  data: [],
-  totals: {
-    prompt_tokens: 2450000,
-    completion_tokens: 890000,
-    total_tokens: 3340000,
-    api_requests: 12500,
-    by_model: [
-      {
-        model: "glm5.3",
-        prompt_tokens: 1300000,
-        completion_tokens: 440000,
-        total_tokens: 1740000,
-        api_requests: 8200,
-      },
-      {
-        model: "qwen3.8-flash",
-        prompt_tokens: 1150000,
-        completion_tokens: 450000,
-        total_tokens: 1600000,
-        api_requests: 4300,
-      },
-      { model: "flux-2-klein", prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, api_requests: 30 },
-      { model: "qwen-image-2.1", prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, api_requests: 21 },
-    ],
-  },
-  all_time: {
-    prompt_tokens: 9800000,
-    completion_tokens: 3400000,
-    total_tokens: 13200000,
-    api_requests: 41250,
-    cached_at: "2026-02-01T12:00:00Z",
-  },
-  has_more: false,
-  next_cursor: null,
+/** `2026-11-01` shifted by `days`, as an ISO instant: fixtures stay valid whenever they run. */
+function monthOffsetIso(days: number): string {
+  return new Date(Date.parse(`${monthStartUtc()}T00:00:00Z`) + days * 86_400_000).toISOString();
+}
+
+const MONTH_WINDOW = { start_date: monthStartUtc(), end_date: monthStartUtc() };
+
+const TOTALS = {
+  prompt_tokens: 2450000,
+  completion_tokens: 890000,
+  total_tokens: 3340000,
+  api_requests: 12500,
+  cached_tokens: 480000,
+  credits: 82.8,
+  by_model: [
+    {
+      model: "glm5.3",
+      prompt_tokens: 1300000,
+      completion_tokens: 440000,
+      total_tokens: 1740000,
+      api_requests: 8200,
+      cached_tokens: 320000,
+      credits: 51.3,
+    },
+    {
+      model: "qwen3.8-flash",
+      prompt_tokens: 1150000,
+      completion_tokens: 450000,
+      total_tokens: 1600000,
+      api_requests: 4300,
+      cached_tokens: 160000,
+      credits: 31.5,
+    },
+    { model: "gemma4", prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, api_requests: 0, credits: 0 },
+    { model: "flux-2-klein", prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, api_requests: 30 },
+    { model: "qwen-image-2.1", prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, api_requests: 21 },
+  ],
 };
 
-// Fixture shaped like the real dashboard quota payload (per streamdeck-nan tests).
+const ALL_TIME = {
+  prompt_tokens: 9800000,
+  completion_tokens: 3400000,
+  total_tokens: 13200000,
+  api_requests: 41250,
+  cached_at: "2026-02-01T12:00:00Z",
+};
+
+/** Inference plan: 7,000 credits a period, this account has spent a fraction of them. */
+const CREDITS = {
+  period_start: monthOffsetIso(-3),
+  period_end: monthOffsetIso(27),
+  allowance: 7000,
+  used: 82.8,
+  remaining: 6917.2,
+  pack_credits: 1000,
+  pack_expires_at: monthOffsetIso(60),
+  frozen: false,
+};
+
+function usageBody(over: Record<string, unknown> = {}) {
+  return {
+    object: "usage.report",
+    ...MONTH_WINDOW,
+    data: [],
+    totals: TOTALS,
+    all_time: ALL_TIME,
+    has_more: false,
+    next_cursor: null,
+    credits: null,
+    ...over,
+  };
+}
+
+const SAMPLE_REPORT = usageBody();
+
+// Fixture shaped like the real dashboard quota payload (per streamdeck-nan tests). It still
+// carries the legacy per-model token caps; only the rolling window is rendered from it.
 const QUOTA_SAMPLE = {
   periodStart: "2026-10-01",
   models: [
@@ -68,7 +107,7 @@ const QUOTA_SAMPLE = {
       model: "glm5.3",
       tokensUsed: 1740000,
       cap: 3000000000,
-      periodEnd: "2026-10-17T05:53:20Z",
+      periodEnd: monthOffsetIso(12),
       windowHours: 4,
       windowTokensUsed: 120000000,
       fullWindowTokens: 400000000,
@@ -85,18 +124,30 @@ function jsonResponse(body: unknown, status = 200, headers: Record<string, strin
   });
 }
 
-/** Routes the published usage endpoint and the dashboard quota service independently. */
+interface Stub {
+  body?: unknown;
+  status?: number;
+}
+
+/**
+ * Routes the three origins the plugin may call: the dashboard quota service, the month-to-date
+ * usage page, and the billing-period page (any other `start_date`). A stub without `body`
+ * reuses `SAMPLE_REPORT`.
+ */
 function nanFetch(
-  usage: { body: unknown; status?: number },
-  quota: { body: unknown; status?: number } = { body: {} },
+  routes: { month?: Stub; period?: Stub; quota?: Stub },
   calls: string[] = [],
-) {
-  return (input: Parameters<typeof fetch>[0]): Promise<Response> => {
+): (input: Parameters<typeof fetch>[0]) => Promise<Response> {
+  return (input: Parameters<typeof fetch>[0]) => {
     const text = String(input);
     calls.push(text);
     if (text.startsWith("https://cloud-api.nan.builders/"))
-      return Promise.resolve(jsonResponse(quota.body, quota.status ?? 200));
-    return Promise.resolve(jsonResponse(usage.body, usage.status ?? 200));
+      return Promise.resolve(jsonResponse(routes.quota?.body ?? {}, routes.quota?.status ?? 200));
+    const start = new URL(text).searchParams.get("start_date");
+    const stub = start === monthStartUtc() ? routes.month : routes.period;
+    if (stub === undefined && routes.period === undefined && start !== monthStartUtc())
+      throw new Error(`unexpected usage request for start_date=${start}`);
+    return Promise.resolve(jsonResponse(stub?.body ?? SAMPLE_REPORT, stub?.status ?? 200));
   };
 }
 
@@ -118,81 +169,182 @@ describe("fetchUsage", () => {
     delete process.env[envInput.locator];
   });
 
-  it("requests usage month-to-date and renders live quota rings when the service answers", async () => {
+  it("renders the credits ring and re-reads the counters over the billing period", async () => {
     const calls: string[] = [];
-    const report = await fetchUsage(envInput, nanFetch({ body: SAMPLE_REPORT }, { body: QUOTA_SAMPLE }, calls));
+    const periodStart = monthOffsetIso(-3).slice(0, 10);
+    const month = usageBody({ credits: CREDITS });
+    const period = usageBody({
+      start_date: periodStart,
+      end_date: monthStartUtc(),
+      credits: CREDITS,
+      totals: { ...TOTALS, total_tokens: 5340000, api_requests: 19000 },
+    });
+    const report = await fetchUsage(
+      envInput,
+      nanFetch({ month: { body: month }, period: { body: period }, quota: { body: QUOTA_SAMPLE } }, calls),
+    );
     expect(report.status).toBe("available");
     if (report.status !== "available") return;
 
-    const usageUrl = new URL(calls.find((c) => c.startsWith("https://api.nan.builders/"))!);
-    expect(usageUrl.pathname).toBe("/v1/usage");
-    expect(usageUrl.searchParams.get("start_date")).toBe(monthStartUtc());
-    expect(usageUrl.searchParams.get("limit")).toBe("1");
-    expect(calls.some((c) => c === "https://cloud-api.nan.builders/api/usage/quota")).toBe(true);
-
-    const ids = report.windows.map((w) => w.id);
-    expect(ids).toEqual([
-      "deepseek-v4-flash:period",
-      "glm5.3:period",
-      "glm5.3:14400s", // windowFromReportedDuration derived identity for the rolling 4h
-    ]);
-    const deepseek = report.windows[0]!;
-    expect(deepseek.usedPct).toBeCloseTo((1218820529 / 3e9) * 100, 5);
-    expect(deepseek.resetsAt).toBe("2026-11-01T00:00:00.000Z");
-    const glmRolling = report.windows.find((w) => w.id === "glm5.3:14400s")!;
-    expect(glmRolling.label).toBe("glm5.3 · 4-hour");
-    // windowFromReportedDuration prefixes the scope label into the short label.
-    expect(glmRolling.shortLabel).toBe("glm5.3 4h");
-    expect(glmRolling.usedPct).toBeCloseTo(30, 5);
-    expect(glmRolling.resetsAt).toBe("2026-10-29T08:00:00.000Z");
-    // The billing period ring uses glm5.3's own periodEnd, not the calendar month.
-    expect(report.windows.find((w) => w.id === "glm5.3:period")?.resetsAt).toBe(
-      "2026-10-17T05:53:20.000Z",
+    const usageDates = calls
+      .filter((c) => c.startsWith("https://api.nan.builders/"))
+      .map((c) => new URL(c).searchParams.get("start_date"));
+    expect(usageDates).toEqual([monthStartUtc(), periodStart]);
+    expect(calls.every((c) => new URL(c).searchParams.get("limit") === "1" || c.startsWith("https://cloud-api"))).toBe(
+      true,
     );
-    // Catalog rings are superseded entirely by live data.
-    expect(ids.some((id) => id.endsWith(":monthly"))).toBe(false);
 
+    // One allowance ring for the whole account, the calendar image budget, and the rolling window.
+    expect(report.windows.map((w) => w.id)).toEqual(["credits:period", "image-pool:monthly", "glm5.3:14400s"]);
+    const credits = report.windows[0]!;
+    expect(credits.label).toBe("Credits · Current period");
+    expect(credits.usedPct).toBeCloseTo((82.8 / 7000) * 100, 5);
+    expect(credits.resetsAt).toBe(new Date(CREDITS.period_end).toISOString());
+    expect(credits.tone).toBe("ok");
+
+    expect(report.planLabel).toBe("Inference");
     const balances = report.balances ?? [];
-    expect(balances.map((b) => [b.id, b.unit, b.used])).toEqual([
-      ["month_tokens", "tokens", 3340000],
-      ["month_requests", "requests", 12500],
-      ["all_time_tokens", "tokens", 13200000],
+    expect(balances.map((b) => [b.id, b.unit])).toEqual([
+      ["credits_period", "credits"],
+      ["credits_packs", "credits"],
+      ["window_tokens", "tokens"],
+      ["window_requests", "requests"],
+      ["all_time_tokens", "tokens"],
     ]);
+    const creditBalance = balances.find((b) => b.id === "credits_period")!;
+    expect(creditBalance.label).toBe("Credits · this period");
+    expect(creditBalance.used).toBe(82.8);
+    expect(creditBalance.remaining).toBe(6917.2);
+    expect(creditBalance.limit).toBe(7000);
+    // The counters beside the ring follow the period, not the calendar month.
+    expect(balances.find((b) => b.id === "window_tokens")?.used).toBe(5340000);
+    expect(balances.find((b) => b.id === "window_tokens")?.label).toBe("Tokens · this period");
+
     const details = report.details ?? [];
-    expect(details.find((d) => d.id === "window")?.value).toBe("2026-10-01 → 2026-10-29");
-    expect(details.find((d) => d.label === "glm5.3")?.value).toBe("1.74M tok · 8.2k req");
+    expect(details.find((d) => d.id === "window")).toEqual({
+      id: "window",
+      label: "Billing period (UTC)",
+      value: `${periodStart} → ${monthStartUtc()}`,
+    });
+    expect(details.find((d) => d.label === "glm5.3")?.value).toBe("51.3 cr · 1.74M tok · 8.2k req");
+    // The credit-hungry models lead, and unmetered ones still show what they used.
+    expect(details.filter((d) => d.id.startsWith("model_")).map((d) => d.label)).toEqual([
+      "glm5.3",
+      "qwen3.8-flash",
+      "flux-2-klein",
+      "gemma4",
+      "qwen-image-2.1",
+    ]);
   });
 
-  it("falls back to catalog rings when the quota service returns nothing usable", async () => {
-    const report = await fetchUsage(envInput, nanFetch({ body: SAMPLE_REPORT }, { body: {} }));
+  it("keeps the month window when the billing period starts on the 1st", async () => {
+    const calls: string[] = [];
+    const credits = { ...CREDITS, period_start: `${monthStartUtc()}T00:00:00Z` };
+    const report = await fetchUsage(
+      envInput,
+      nanFetch({ month: { body: usageBody({ credits }) }, quota: { body: QUOTA_SAMPLE } }, calls),
+    );
+    expect(calls.filter((c) => c.startsWith("https://api.nan.builders/")).length).toBe(1);
     expect(report.status).toBe("available");
     if (report.status !== "available") return;
-    const ids = report.windows.map((w) => w.id);
-    expect(ids).toContain("qwen3.8-flash:monthly");
-    expect(ids).toContain("image-pool:monthly");
-    expect(ids).not.toContain("glm5.3:period");
+    expect(report.details?.find((d) => d.id === "window")?.label).toBe("Window (UTC)");
+    expect(report.balances?.find((b) => b.id === "window_tokens")?.label).toBe("Tokens · this month");
+  });
+
+  it("shows no credit ring for accounts the API does not bill in credits", async () => {
+    const report = await fetchUsage(envInput, nanFetch({ month: { body: SAMPLE_REPORT }, quota: { body: {} } }));
+    expect(report.status).toBe("available");
+    if (report.status !== "available") return;
+    expect(report.windows.map((w) => w.id)).toEqual(["image-pool:monthly"]);
+    expect(report.planLabel).toBeUndefined();
+    expect(report.balances?.map((b) => b.id)).toEqual([
+      "window_tokens",
+      "window_requests",
+      "all_time_tokens",
+    ]);
+  });
+
+  it("falls back to per-model quotas on a plan without credits, like Gentle", async () => {
+    const report = await fetchUsage(
+      envInput,
+      nanFetch({ month: { body: SAMPLE_REPORT }, quota: { body: QUOTA_SAMPLE } }),
+    );
+    expect(report.status).toBe("available");
+    if (report.status !== "available") return;
+    // No credits block: the quota service's caps are this account's real allowance.
+    expect(report.windows.map((w) => w.id)).toEqual([
+      "image-pool:monthly",
+      "deepseek-v4-flash:period",
+      "glm5.3:14400s",
+      "glm5.3:period",
+    ]);
+    expect(report.balances?.some((b) => b.unit === "credits")).toBe(false);
+  });
+
+  it("warns while the subscription is frozen", async () => {
+    const credits = { ...CREDITS, period_start: `${monthStartUtc()}T00:00:00Z`, frozen: true };
+    const report = await fetchUsage(
+      envInput,
+      nanFetch({ month: { body: usageBody({ credits }) }, quota: { body: {} } }),
+    );
+    expect(report.status).toBe("available");
+    if (report.status !== "available") return;
+    expect(report.windows[0]?.tone).toBe("danger");
+    expect(report.balances?.find((b) => b.id === "credits_period")?.tone).toBe("danger");
+    const frozen = report.details?.find((d) => d.id === "frozen");
+    expect(frozen?.tone).toBe("danger");
+    expect(frozen?.value).toMatch(/Frozen/);
+  });
+
+  it("falls back to the month counters when the period page fails", async () => {
+    const calls: string[] = [];
+    const report = await fetchUsage(
+      envInput,
+      nanFetch(
+        { month: { body: usageBody({ credits: CREDITS }) }, period: { body: {}, status: 500 }, quota: { body: {} } },
+        calls,
+      ),
+    );
+    expect(calls.filter((c) => c.startsWith("https://api.nan.builders/")).length).toBe(2);
+    expect(report.status).toBe("available");
+    if (report.status !== "available") return;
+    expect(report.windows.map((w) => w.id)).toEqual(["credits:period", "image-pool:monthly"]);
+    expect(report.balances?.find((b) => b.id === "window_tokens")?.label).toBe("Tokens · this month");
+  });
+
+  it("ignores the legacy per-model token caps and keeps only the rolling window", async () => {
+    const report = await fetchUsage(
+      envInput,
+      nanFetch({ month: { body: usageBody({ credits: CREDITS }) }, period: { body: usageBody({ credits: CREDITS }) }, quota: { body: QUOTA_SAMPLE } }),
+    );
+    expect(report.status).toBe("available");
+    if (report.status !== "available") return;
+    expect(report.windows.some((w) => w.id.endsWith(":period") && w.id !== "credits:period")).toBe(false);
+    expect(report.windows.some((w) => w.id === "glm5.3:14400s")).toBe(true);
   });
 
   it("treats quota transport failures as absent, not fatal", async () => {
     const report = await fetchUsage(
       envInput,
-      nanFetch({ body: SAMPLE_REPORT }, { body: { error: "boom" }, status: 503 }),
+      nanFetch({ month: { body: SAMPLE_REPORT }, quota: { body: { error: "boom" }, status: 503 } }),
     );
     expect(report.status).toBe("available");
     if (report.status !== "available") return;
-    expect(report.windows.some((w) => w.id.endsWith(":monthly"))).toBe(true);
+    expect(report.windows.map((w) => w.id)).toEqual(["image-pool:monthly"]);
   });
 
-  it("honors an api_base override and drops quota rings and the quota call on mirror hosts", async () => {
+  it("honors an api_base override: no quota call and no catalog rings", async () => {
     const calls: string[] = [];
+    const credits = { ...CREDITS, period_start: `${monthStartUtc()}T00:00:00Z` };
     const report = await fetchUsage(
       { ...envInput, api_base: "https://api.helmcode.com/v1/" },
-      nanFetch({ body: SAMPLE_REPORT }, { body: QUOTA_SAMPLE }, calls),
+      nanFetch({ month: { body: usageBody({ credits }) }, quota: { body: QUOTA_SAMPLE } }, calls),
     );
     expect(calls.some((c) => c.startsWith("https://cloud-api.nan.builders/"))).toBe(false);
     expect(report.status).toBe("available");
     if (report.status !== "available") return;
-    expect(report.windows).toEqual([]);
+    // What the mirror reports about itself still renders; the nan catalog does not.
+    expect(report.windows.map((w) => w.id)).toEqual(["credits:period"]);
     expect((report.balances?.length ?? 0) > 0).toBe(true);
   });
 
@@ -241,81 +393,151 @@ describe("fetchUsage", () => {
   });
 });
 
+describe("buildCreditWindows", () => {
+  it("meters the whole pool against the allowance and resets on the billing date", () => {
+    const windows = buildCreditWindows(CREDITS);
+    expect(windows.map((w) => w.id)).toEqual(["credits:period"]);
+    expect(windows[0]?.usedPct).toBeCloseTo((82.8 / 7000) * 100, 5);
+    expect(windows[0]?.resetsAt).toBe(new Date(CREDITS.period_end).toISOString());
+  });
+
+  it("reads danger while the subscription is frozen", () => {
+    expect(buildCreditWindows({ ...CREDITS, frozen: true })[0]?.tone).toBe("danger");
+  });
+
+  it("shows no ring without an allowance: pack-only accounts have no percentage to draw", () => {
+    expect(buildCreditWindows(null)).toEqual([]);
+    expect(buildCreditWindows({ ...CREDITS, allowance: 0 })).toEqual([]);
+    expect(buildCreditWindows({ ...CREDITS, used: undefined })).toEqual([]);
+  });
+});
+
+describe("buildCreditBalances", () => {
+  it("reports the allowance and the packs left", () => {
+    const balances = buildCreditBalances(CREDITS);
+    expect(balances.map((b) => b.id)).toEqual(["credits_period", "credits_packs"]);
+    expect(balances[1]?.remaining).toBe(1000);
+    expect(balances[1]?.resetsAt).toBe(new Date(CREDITS.pack_expires_at).toISOString());
+  });
+
+  it("derives the remainder when the API omits it", () => {
+    const { remaining: _drop, ...rest } = CREDITS;
+    expect(buildCreditBalances(rest)[0]?.remaining).toBeCloseTo(7000 - 82.8, 5);
+  });
+
+  it("skips empty packs and accounts with no allowance", () => {
+    expect(buildCreditBalances({ ...CREDITS, allowance: 0 })[0]?.id).toBe("credits_packs");
+    expect(buildCreditBalances({ ...CREDITS, pack_credits: 0 }).map((b) => b.id)).toEqual(["credits_period"]);
+    expect(buildCreditBalances(null)).toEqual([]);
+  });
+});
+
+describe("planLabelFor", () => {
+  it("names the tier from its documented allowance", () => {
+    expect(planLabelFor(CREDITS)).toBe("Inference");
+    expect(planLabelFor({ ...CREDITS, allowance: 20000 })).toBe("Premium");
+    expect(planLabelFor({ ...CREDITS, allowance: 1234 })).toBeUndefined();
+    expect(planLabelFor(null)).toBeUndefined();
+  });
+});
+
 describe("buildLiveWindows", () => {
-  it("prefers fullCap over a prorated first-period cap", () => {
-    const windows = buildLiveWindows({
-      models: [{ model: "m", tokensUsed: 50, cap: 100, fullCap: 200 }],
-    });
+  it("drops the per-model token caps on a credit-billed account: the pool is the allowance", () => {
+    expect(
+      buildLiveWindows(
+        {
+          models: [
+            { model: "m", tokensUsed: 50, cap: 100, fullCap: 200 },
+            { model: "free", tokensUsed: 7, cap: 0 },
+            { model: "unmetered", tokensUsed: 9 },
+          ],
+        },
+        true,
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps them for an account without credits: the Gentle plan still meters per model", () => {
+    const windows = buildLiveWindows(
+      {
+        periodEnd: "2026-12-01T00:00:00Z",
+        models: [
+          { model: "m", tokensUsed: 50, cap: 100, fullCap: 200 },
+          { model: "unused", tokensUsed: 0, cap: 100 },
+          { model: "uncapped", tokensUsed: 12 },
+        ],
+      },
+      false,
+    );
+    expect(windows.map((w) => w.id)).toEqual(["m:period"]);
+    // fullCap wins over the prorated first-period cap, and the root periodEnd is the reset.
     expect(windows[0]?.usedPct).toBeCloseTo(25, 5);
+    expect(windows[0]?.resetsAt).toBe("2026-12-01T00:00:00.000Z");
   });
 
-  it("skips unmetered models: cap 0 or no allowance at all", () => {
-    const windows = buildLiveWindows({
-      models: [
-        { model: "free", tokensUsed: 7, cap: 0 },
-        { model: "unmetered", tokensUsed: 9 },
-      ],
-    });
-    expect(windows).toEqual([]);
-  });
-
-  it("shows no ring for catalog models the key has not used (e.g. glm5.3 on a non-premium tier)", () => {
-    const windows = buildLiveWindows({
-      models: [
-        { model: "glm5.3", tokensUsed: 0, cap: 3e9, windowHours: 4, windowTokensUsed: 0, fullWindowTokens: 4e8 },
-        { model: "deepseek-v4-flash", tokensUsed: 1200, cap: 3e9 },
-      ],
-    });
-    expect(windows.map((w) => w.id)).toEqual(["deepseek-v4-flash:period"]);
+  it("prefers a model's own periodEnd over the root one", () => {
+    const windows = buildLiveWindows(
+      {
+        periodEnd: "2026-12-01T00:00:00Z",
+        models: [{ model: "m", tokensUsed: 1, cap: 100, periodEnd: "2026-10-17T05:53:20Z" }],
+      },
+      false,
+    );
+    expect(windows[0]?.resetsAt).toBe("2026-10-17T05:53:20.000Z");
   });
 
   it("names a rolling sub-window from its reported duration", () => {
-    const windows = buildLiveWindows({
-      models: [
-        {
-          model: "glm5.3",
-          tokensUsed: 0,
-          cap: 3e9,
-          windowHours: 4,
-          windowTokensUsed: 360000000,
-          fullWindowTokens: 400000000,
-        },
-      ],
-    });
-    const rolling = windows.find((w) => w.id === "glm5.3:14400s");
-    expect(rolling?.label).toBe("glm5.3 · 4-hour");
-    expect(rolling?.usedPct).toBeCloseTo(90, 5);
-    expect(rolling?.tone).toBe("warning");
+    const windows = buildLiveWindows(
+      {
+        models: [{ model: "glm5.3", windowHours: 4, windowTokensUsed: 360000000, fullWindowTokens: 400000000 }],
+      },
+      true,
+    );
+    expect(windows.map((w) => w.id)).toEqual(["glm5.3:14400s"]);
+    expect(windows[0]?.label).toBe("glm5.3 · 4-hour");
+    expect(windows[0]?.usedPct).toBeCloseTo(90, 5);
+    expect(windows[0]?.tone).toBe("warning");
   });
 
   it("uses a neutral Rolling identity when the duration is not reported", () => {
-    const windows = buildLiveWindows({
-      models: [{ model: "x", tokensUsed: 1, windowTokensUsed: 1, windowTokens: 2 }],
-    });
+    const windows = buildLiveWindows({ models: [{ model: "x", windowTokensUsed: 1, windowTokens: 2 }] }, true);
     expect(windows[0]?.id).toBe("x:rolling");
     expect(windows[0]?.label).toBe("x · Rolling");
   });
 
-  it("falls back to the root periodEnd for the model reset", () => {
-    const windows = buildLiveWindows({
-      periodEnd: "2026-11-01T00:00:00Z",
-      models: [{ model: "m", tokensUsed: 1, cap: 100 }],
-    });
-    expect(windows[0]?.resetsAt).toBe("2026-11-01T00:00:00.000Z");
+  it("skips empty rolling windows and models without a budget", () => {
+    expect(
+      buildLiveWindows(
+        {
+          models: [
+            { model: "glm5.3", windowHours: 4, windowTokensUsed: 0, fullWindowTokens: 400000000 },
+            { model: "glm5.2", windowHours: 4, windowTokensUsed: 5000 },
+          ],
+        },
+        true,
+      ),
+    ).toEqual([]);
   });
 });
 
 describe("buildMonthlyWindows", () => {
   it("skips quotas without month usage", () => {
     expect(buildMonthlyWindows([])).toEqual([]);
+    // Token-using chat models no longer have a catalog ring of their own: only images do.
+    expect(
+      buildMonthlyWindows([{ model: "qwen3.8-flash", total_tokens: 4.8e8, api_requests: 10 }]),
+    ).toEqual([]);
   });
 
-  it("flags near-exhausted quotas with the danger tone", () => {
+  it("counts the shared image pool and flags a spent budget", () => {
     const windows = buildMonthlyWindows([
-      { model: "qwen3.8-flash", total_tokens: 4.8e8, api_requests: 10 },
+      { model: "flux-2-klein", api_requests: 60 },
+      { model: "qwen-image-2.1", api_requests: 40 },
     ]);
+    expect(windows.map((w) => w.id)).toEqual(["image-pool:monthly"]);
+    expect(windows[0]?.usedPct).toBeCloseTo(100, 5);
     expect(windows[0]?.tone).toBe("danger");
-    expect(windows[0]?.usedPct).toBeCloseTo(96, 5);
+    expect(windows[0]?.resetsAt).toBe(nextMonthResetIso());
   });
 });
 
@@ -592,14 +814,55 @@ describe("discover", () => {
 
 describe("toUsageReport", () => {
   it("degrades gracefully when counters are missing", () => {
-    const report = toUsageReport({
-      start_date: "2026-10-01",
-      end_date: "2026-10-01",
-      totals: { by_model: [] },
-    });
+    const empty = { start_date: "2026-11-01", end_date: "2026-11-01", totals: { by_model: [] } };
+    const report = toUsageReport({ counters: empty, month: empty });
     expect(report.status).toBe("available");
     if (report.status !== "available") return;
-    expect(report.balances).toEqual([]);
     expect(report.windows).toEqual([]);
+    expect(report.balances).toEqual([]);
+    expect(report.details?.map((d) => d.id)).toEqual(["window"]);
+  });
+
+  it("reports the image budget on the calendar month even when counters span the period", () => {
+    const month = usageBody({ credits: CREDITS });
+    const period = usageBody({
+      start_date: monthOffsetIso(-3).slice(0, 10),
+      credits: CREDITS,
+      totals: { ...TOTALS, by_model: TOTALS.by_model.slice(0, 2) },
+    });
+    const report = toUsageReport({ counters: period, month });
+    expect(report.status).toBe("available");
+    if (report.status !== "available") return;
+    // The period has no image rows at all: the ring still comes from the month response.
+    expect(report.windows.map((w) => w.id)).toEqual(["credits:period", "image-pool:monthly"]);
+    expect(report.windows[1]?.usedPct).toBeCloseTo(51, 5);
+  });
+
+  it("ignores a credits block the API did not send", () => {
+    const report = toUsageReport({ counters: SAMPLE_REPORT, month: SAMPLE_REPORT, quota: null });
+    expect(report.status).toBe("available");
+    if (report.status !== "available") return;
+    expect(report.windows.map((w) => w.id)).toEqual(["image-pool:monthly"]);
+    expect(report.balances?.some((b) => b.unit === "credits")).toBe(false);
+  });
+
+  it("marks the no-counter models instead of leaving their credits blank", () => {
+    const rows = [
+      { model: "whisper", total_tokens: 40000, api_requests: 12, credits: 0 },
+      { model: "qwen3-embedding", total_tokens: 724000, api_requests: 406 },
+      { model: "glm5.3", total_tokens: 83, api_requests: 1, credits: 0 },
+      { model: "flux-2-klein", total_tokens: 0, api_requests: 3 },
+    ];
+    const body = usageBody({ totals: { ...TOTALS, by_model: rows } });
+    const report = toUsageReport({ counters: body, month: body });
+    expect(report.status).toBe("available");
+    if (report.status !== "available") return;
+    const value = (label: string) => report.details?.find((d) => d.label === label)?.value;
+    expect(value("whisper")).toBe("∞ unmetered · 40k tok · 12 req");
+    expect(value("qwen3-embedding")).toBe("∞ unmetered · 724k tok · 406 req");
+    // A credit-billed model whose spend rounds below 0.1 stays blank, and so does the image
+    // pool: its budget is its own ring, not an unlimited counter.
+    expect(value("glm5.3")).toBe("83 tok · 1 req");
+    expect(value("flux-2-klein")).toBe("0 tok · 3 req");
   });
 });

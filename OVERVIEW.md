@@ -4,13 +4,14 @@ nan is an OpenAI-compatible inference API for open models on a shared EU cluster
 
 ## How it works
 
-The plugin calls `GET https://api.nan.builders/v1/usage` from the daemon with your nan inference API key (`sk-...`) as a bearer token, month-to-date in UTC. Paseo renders a nan card with:
+The plugin calls `GET https://api.nan.builders/v1/usage` from the daemon with your nan inference API key (`sk-...`) as a bearer token. Paseo renders a nan card with:
 
-- Live quota rings (`used/cap` per model, each model's real reset time, and glm5.3's rolling 4h window when reported). When the quota service does not answer, the plugin falls back to the published monthly catalog quotas (deepseek-v4-flash 3B, mimo-v2.6-flash 1B, qwen3.8-flash 500M, glm5.3-flash 2B, shared image pool 100 req) computed from the daily usage rows
-- Tokens and API requests so far this month, plus lifetime tokens
-- A per-model breakdown (tokens and requests for each model)
+- One allowance ring for the credit pool every model draws from: percent used in the current billing period and its real renewal instant (the member's Stripe date, not the calendar 1st), red while the subscription is frozen. Accounts the API does not bill in credits show counters only
+- The shared image pool (100 requests/month) and, when the quota service reports one, glm5.3's 400M-token rolling 4h window
+- Credits used, left and allowance for the period, credit packs with their expiry, tokens and API requests over the same billing window, plus lifetime tokens
+- A per-model breakdown with what each model billed in credits (`52.2 cr · 487.9M tok · 4.6k req`), led by the most expensive, plus the in/out split and cached input. Catalog models billed with no counter render `∞ unmetered` rather than a blank; a credit-priced model that rounds below 0.1 credits shows no figure
 
-Requests go only to the fixed origins `api.nan.builders` and `cloud-api.nan.builders`; a quota-service failure never hides the usage counters, and mirror hosts (custom `api_base`) show counters without rings.
+Since November 2026 the chat models have no token allowance of their own: each one spends the shared pool at its own price per token, so the plugin shows per-model credits instead of per-model rings. Accounts that carry no credits at all (the Gentle plan still meters a monthly quota per model) keep getting those rings from the quota service, and which one applies is decided by whether the API returned a credits block. Requests go only to the fixed origins `api.nan.builders` and `cloud-api.nan.builders`; a quota-service failure never hides the usage counters, and mirror hosts (custom `api_base`) show only what their own API reports.
 
 ## Setup
 
